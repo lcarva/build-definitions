@@ -54,6 +54,10 @@ spec:
     description: The image is built from this commit.
     type: string
     default: ""
+  - name: SBOM_REPO
+    description: OCI repo to push the SBOM blob to.
+    type: string
+    default: quay.io/lucarval/sbom
   results:
   - description: Digest of the image just built
     name: IMAGE_DIGEST
@@ -66,6 +70,8 @@ spec:
     type: string
   - name: JAVA_COMMUNITY_DEPENDENCIES
     description: The Java dependencies that came from community sources such as Maven central.
+  - name: IMAGE_SBOM_URL
+    description: Reference, including digest, to the SBOM blob.
   stepTemplate:
     env:
     - name: BUILDAH_FORMAT
@@ -86,6 +92,8 @@ spec:
       value: $(params.TLSVERIFY)
     - name: IMAGE_EXPIRES_AFTER
       value: $(params.IMAGE_EXPIRES_AFTER)
+    - name: SBOM_REPO
+      value: $(params.SBOM_REPO)
   steps:
   - image: $(params.BUILDER_IMAGE)
     name: build
@@ -308,6 +316,9 @@ spec:
       cat "$(workspaces.source.path)"/image-digest | tee $(results.IMAGE_DIGEST.path)
       echo -n "$IMAGE" | tee $(results.IMAGE_URL.path)
 
+      sbom_digest="$(sha256sum sbom-cyclonedx.json | cut -d' ' -f1)"
+      echo -n "${SBOM_REPO}@sha256:${sbom_digest}" | tee $(results.IMAGE_SBOM_URL.path)
+
     securityContext:
       runAsUser: 0
       capabilities:
@@ -328,6 +339,15 @@ spec:
       - --type
       - cyclonedx
       - $(params.IMAGE)
+    workingDir: $(workspaces.source.path)
+
+  - name: upload-sbom-blob
+    image: docker.io/bitnami/oras:latest
+    args:
+      - blob
+      - push
+      - $(params.SBOM_REPO)
+      - sbom-cyclonedx.json
     workingDir: $(workspaces.source.path)
 
   volumes:
