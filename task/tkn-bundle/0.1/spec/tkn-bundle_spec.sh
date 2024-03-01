@@ -6,6 +6,8 @@ set -o nounset
 
 eval "$(shellspec - -c) exit 1"
 
+DOCKER_AUTHFILE="${DOCKER_AUTHFILE-"${HOME}/.docker/config.json"}"
+
 Describe "tkn-bundle task"
   setup() {
     if ! command -v kubectl &> /dev/null; then
@@ -41,6 +43,9 @@ nodes:
     hostPort: 5000
     listenAddress: 127.0.0.1
     protocol: TCP
+  extraMounts:
+  - containerPath: /var/lib/kubelet/config.json
+    hostPath: $DOCKER_AUTHFILE
 EOF
 } || { echo 'ERROR: Unable to create a kind cluster'; return 1; }
     kubectl cluster-info 2>&1 || { echo 'ERROR: Failed to access the cluster'; return 1; }
