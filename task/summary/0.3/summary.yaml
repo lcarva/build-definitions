@@ -2,7 +2,7 @@ apiVersion: tekton.dev/v1
 kind: Task
 metadata:
   labels:
-    app.kubernetes.io/version: "0.2"
+    app.kubernetes.io/version: "0.3"
   annotations:
     tekton.dev/pipelines.minVersion: "0.12.1"
     tekton.dev/tags: "appstudio, hacbs"
@@ -21,10 +21,9 @@ spec:
       description: State of build task in pipelineRun
       # Default Succeeded for backward compatibility
       default: Succeeded
-  workspaces:
-    - name: workspace
-      description: The workspace where source code is included.
-      optional: true
+    - name: source-image-url
+      description: URL of the source container image
+      default: ""
   steps:
     - name: appstudio-summary
       image: quay.io/redhat-appstudio/appstudio-utils:5bd7d6cb0b17f9f2eab043a8ad16ba3d90551bc2@sha256:8c7fcf86af40c71aeb58e4279625c8308af5144e2f6b8e28b0ec7e795260e5f7
@@ -39,8 +38,8 @@ spec:
           value: $(params.pipelinerun-name)
         - name: BUILD_TASK_STATUS
           value: $(params.build-task-status)
-        - name: SOURCE_BUILD_RESULT_FILE
-          value: "$(workspaces.workspace.path)/source_build_result.json"
+        - name: SOURCE_IMAGE_URL
+          value: $(params.source-image-url)
       script: |
         #!/usr/bin/env bash
         echo
@@ -50,9 +49,8 @@ spec:
         if [ "$BUILD_TASK_STATUS" == "Succeeded" ]; then
           echo "Generated Image is in : $IMAGE_URL"
         fi
-        if [ -e "$SOURCE_BUILD_RESULT_FILE" ]; then
-          url=$(jq -r ".image_url" <"$SOURCE_BUILD_RESULT_FILE")
-          echo "Generated Source Image is in : $url"
+        if [ -n "$SOURCE_IMAGE_URL" ]; then
+          echo "Generated Source Image is in : $SOURCE_IMAGE_URL"
         fi
         echo
         echo End Summary
