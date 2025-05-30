@@ -1,0 +1,118 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: extract-file-from-image
+  labels:
+    app.kubernetes.io/version: "0.1"
+spec:
+  description: >-
+    Extracts a file from a container image using the OCI image specification.
+    This task can be used to extract files like SBOMs, licenses, or other artifacts that were added to an image.
+  params:
+    - name: FROM_IMAGE_URL
+      description: OCI repository URL of the image to extract files from
+      type: string
+    - name: FROM_IMAGE_DIGEST
+      description: Digest of the image to extract files from
+      type: string
+    - name: IMAGE_FILE_PATH
+      description: Path to the file within the image to extract
+      type: string
+    - name: IMAGE_EXPIRES_AFTER
+      description: Expiration date for the file artifacts created in the
+        OCI repository. An empty string means the artifacts do not expire.
+      type: string
+      default: ""
+    - name: OCI_STORAGE
+      description: The Image Manifest to be created. It wraps the created OCI artifact.
+      type: string
+    - name: DEBUG
+      description: Set it to "true" to enable debug output
+      type: string
+      default: "false"
+  results:
+    # These results are purposely called this way so the copied artifact is signed and attested by Tekton Chains.
+    # See https://tekton.dev/docs/chains/slsa-provenance/#output-artifacts for more details.
+    - name: ARTIFACT_URI
+      description: The OCI reference to the extracted file
+    - name: ARTIFACT_DIGEST
+      description: The digest of the extracted file
+  volumes:
+    - name: workdir
+      emptyDir: {}
+  stepTemplate:
+    workingDir: /var/workdir
+    volumeMounts:
+      - mountPath: /var/workdir
+        name: workdir
+    env:
+      - name: DEBUG
+        value: $(params.DEBUG)
+  steps:
+
+    - name: extract-file
+      image: quay.io/konflux-ci/konflux-test:v1.4.23@sha256:e451a01a24824fbac8c3a667924337f67153a5bdaa68001410183bbac37e000f
+      env:
+        - name: FROM_IMAGE_URL
+          value: $(params.FROM_IMAGE_URL)
+        - name: FROM_IMAGE_DIGEST
+          value: $(params.FROM_IMAGE_DIGEST)
+        - name: IMAGE_FILE_PATH
+          value: $(params.IMAGE_FILE_PATH)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        if [ "${DEBUG}" = "true" ]; then
+          set -x
+        fi
+
+        source /utils.sh
+
+        # Combine image URL and digest
+        image_with_digest="${FROM_IMAGE_URL}@${FROM_IMAGE_DIGEST}"
+
+        # Extract the file using skopeo and umoci
+        echo "Extracting ${IMAGE_FILE_PATH} file from image: ${FROM_IMAGE_URL}"
+        retry oc image extract --registry-config ~/.docker/config.json "${image_with_digest}" --file "${IMAGE_FILE_PATH}"
+
+        # Allow the next step to read the extracted file.
+        chmod a+r *
+
+        if [ "${DEBUG}" = "true" ]; then
+          ls -la .
+        fi
+
+    - name: create-artifact
+      image: quay.io/konflux-ci/oras:latest@sha256:8d756a91aae1fa5186efafee056446bb5e77228cf5ad9a7ae0e3f8d727da50cd
+      env:
+        - name: IMAGE_EXPIRES_AFTER
+          value: $(params.IMAGE_EXPIRES_AFTER)
+        - name: OCI_STORAGE
+          value: $(params.OCI_STORAGE)
+      script: |
+        #!/bin/bash
+        set -euo pipefail
+        if [ "${DEBUG}" = "true" ]; then
+          set -x
+        fi
+
+        FILE_NAME=$(ls -1 | head -n 1)
+        if [ -z "${FILE_NAME}" ]; then
+          echo "No file found in the extracted directory!"
+          exit 1
+        fi
+
+        FILE_DIGEST=$(sha256sum "${FILE_NAME}" | cut -d ' ' -f1)
+
+        echo "Found file ${FILE_NAME} with digest: ${FILE_DIGEST}"
+
+        oras_opts=()
+        if [ -n "$IMAGE_EXPIRES_AFTER" ]; then
+          oras_opts+=("--annotation" "quay.expires-after=$IMAGE_EXPIRES_AFTER")
+        fi
+
+        oras push "${oras_opts[@]}" --registry-config <(select-oci-auth ${OCI_STORAGE}) "${OCI_STORAGE}" "${FILE_NAME}"
+
+        echo -n "sha256:${FILE_DIGEST}" > $(results.ARTIFACT_DIGEST.path)
+        echo -n "${OCI_STORAGE}" > $(results.ARTIFACT_URI.path)
