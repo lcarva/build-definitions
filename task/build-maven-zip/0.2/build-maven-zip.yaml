@@ -1,0 +1,268 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-maven-zip
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: "maven-build, konflux"
+  labels:
+    app.kubernetes.io/version: "0.2"
+    build.appstudio.redhat.com/build_type: "maven-zip"
+spec:
+  description: |-
+    Build-maven-zip task builds prefetched maven artifacts into a OCI-artifact with zip bundle  and pushes the OCI-artifact into container registry.
+    In addition it will use the SBOM file in prefetch-task, pushes the SBOM file to same registry of zip oci-artifact using cosign tool.
+    Note that this task needs the output of prefetch-dependencies task. If it is not activated, there will not be any output from this task.
+  params:
+  - description: Reference of the OCI-Artifact this build task will produce.
+    name: IMAGE
+    type: string
+  - default: "maven-repository"
+    description: The root directory of the artifacts under the prefetched directory. Will be kept in the maven zip as the top directory for all artifacts.
+    name: PREFETCH_ROOT
+    type: string
+  - default: "maven-repository"
+    description: The zip bundle file name of archived artifacts
+    name: FILE_NAME
+    type: string
+  - default: ""
+    description: Delete image tag after specified time. Empty means to keep the image tag. Time values could be something like 1h, 2d, 3w for hours, days, and weeks, respectively.
+    name: IMAGE_EXPIRES_AFTER
+    type: string
+  - name: caTrustConfigMapName
+    type: string
+    description: The name of the ConfigMap to read CA bundle data from.
+    default: trusted-ca
+  - name: caTrustConfigMapKey
+    type: string
+    description: The name of the key in the ConfigMap that contains the CA bundle data.
+    default: ca-bundle.crt
+  - name: SBOM_SKIP_VALIDATION
+    description: Flag to enable or disable SBOM validation before save. Validation is optional - use this if you are experiencing performance issues.
+    type: string
+    default: "false"
+  - name: SOURCE_URL
+    description: Git repository URL of the source for org.opencontainers.image.source annotation.
+    type: string
+  - name: COMMIT_SHA
+    description: Git commit SHA of the source for org.opencontainers.image.revision annotation.
+    type: string
+  results:
+  - description: Digest of the OCI-Artifact just built
+    name: IMAGE_DIGEST
+  - description: OCI-Artifact repository and tag where the built OCI-Artifact was pushed
+    name: IMAGE_URL
+  - description: OCI-Artifact reference of the built OCI-Artifact
+    name: IMAGE_REF
+  - name: SBOM_BLOB_URL
+    description: Reference of SBOM blob digest to enable digest-based verification from provenance
+    type: string
+  stepTemplate:
+    env:
+    - name: IMAGE
+      value: $(params.IMAGE)
+    - name: PKG_ROOT
+      value: $(params.PREFETCH_ROOT)
+    - name: FILE_NAME
+      value: $(params.FILE_NAME)
+    - name: IMAGE_EXPIRES_AFTER
+      value: $(params.IMAGE_EXPIRES_AFTER)
+    - name: SBOM_SKIP_VALIDATION
+      value: $(params.SBOM_SKIP_VALIDATION)
+    - name: SOURCE_URL
+      value: $(params.SOURCE_URL)
+    - name: COMMIT_SHA
+      value: $(params.COMMIT_SHA)
+    volumeMounts:
+      - mountPath: /shared
+        name: shared
+
+  steps:
+  - image: quay.io/konflux-ci/task-runner:1.4.1@sha256:d9feec6f2ce9b10cfb76b45ea14f83b5ed9f231de7d6083291550aebe8eb09ea
+    name: prepare
+    computeResources:
+      limits:
+        memory: 8Gi
+      requests:
+        memory: 2Gi
+        cpu: '1'
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      # Generate checksums for all maven artifact files. It will ignore the checksum files
+      # and signature files if they existed there
+      pkgpath="$(workspaces.source.path)/cachi2/output/deps/generic"
+      if [ -d "$pkgpath/${PKG_ROOT}" ]; then
+        echo "Generating checksums for artifacts"
+        while IFS= read -r -d '' f
+        do
+          md5sum "$f" | awk '{print $1}'> "$f.md5"
+          sha1sum "$f" | awk '{print $1}'> "$f.sha1"
+          sha256sum "$f" | awk '{print $1}'> "$f.sha256"
+        done <   <(find "$pkgpath/${PKG_ROOT}" -type f ! -name "*.md5" \
+        ! -name "*.sha1" ! -name "*.sha128" ! -name "*.sha256" \
+        ! -name "*.sha512" ! -name "*.asc" -print0)
+        # Bundle the artifacts and checksums together into a zip file
+        cd "$pkgpath"
+        echo "create maven zip to $(workspaces.source.path)/cachi2/output/${FILE_NAME}.zip"
+        zip -rq "${FILE_NAME}.zip" "${PKG_ROOT}"
+        mv "${FILE_NAME}.zip" "/shared/${FILE_NAME}.zip"
+      else
+        echo "No ${PKG_ROOT} dir found, can not generate maven zip!"
+        exit 1
+      fi
+    securityContext:
+      capabilities:
+        add:
+          - SETFCAP
+      runAsUser: 0
+      runAsNonRoot: false
+    workingDir: $(workspaces.source.path)
+  - image: quay.io/konflux-ci/task-runner:1.4.1@sha256:d9feec6f2ce9b10cfb76b45ea14f83b5ed9f231de7d6083291550aebe8eb09ea
+    name: build
+    computeResources:
+      limits:
+        memory: 8Gi
+      requests:
+        memory: 2Gi
+        cpu: '1'
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      if [ -f "/shared/${FILE_NAME}.zip" ]; then
+        mv "/shared/${FILE_NAME}.zip" "./${FILE_NAME}.zip"
+        select-oci-auth "$IMAGE" > auth.json
+        ANNOTATIONS=("--annotation" "org.opencontainers.image.source=${SOURCE_URL}" "--annotation" "org.opencontainers.image.revision=${COMMIT_SHA}")
+        [ -n "$IMAGE_EXPIRES_AFTER" ] && ANNOTATIONS+=("--annotation" "quay.expires-after=$IMAGE_EXPIRES_AFTER")
+        echo "Pushing image ${IMAGE} to registry"
+        if ! retry oras push "$IMAGE" \
+          --registry-config auth.json \
+          "${ANNOTATIONS[@]}" \
+          --artifact-type application/vnd.maven+zip "${FILE_NAME}.zip"
+        then
+          echo "Failed to push image ${IMAGE} to registry"
+          exit 1
+        fi
+        if ! RESULTING_DIGEST=$(retry oras resolve --registry-config auth.json "${IMAGE}")
+        then
+          echo "Failed to get digest for ${IMAGE} from registry"
+          exit 1
+        fi
+        echo -n "$IMAGE" | tee "$(results.IMAGE_URL.path)"
+        echo -n "$RESULTING_DIGEST" | tee "$(results.IMAGE_DIGEST.path)"
+        echo -n "${IMAGE}@${RESULTING_DIGEST}" | tee "$(results.IMAGE_REF.path)"
+      else
+        echo "The maven zip file is not found!"
+        exit 1
+      fi
+    securityContext:
+      capabilities:
+        add:
+          - SETFCAP
+      runAsUser: 0
+      runAsNonRoot: false
+    volumeMounts:
+    - name: trusted-ca
+      mountPath: /mnt/trusted-ca
+      readOnly: true
+    workingDir: $(workspaces.source.path)
+  - image: quay.io/konflux-ci/mobster:1.1.0-1770046049@sha256:7415f55121f5580ac79dc6e6567383574ee5f94f97736f235a141688f02e6094
+    name: save-sbom
+    computeResources:
+      limits:
+        memory: 512Mi
+      requests:
+        memory: 256Mi
+        cpu: 100m
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+
+      IMAGE_URL="$(cat "$(results.IMAGE_URL.path)")"
+      IMAGE_DIGEST="$(cat "$(results.IMAGE_DIGEST.path)")"
+
+      # Use Mobster to generate maven-zip SBOM file using the Hermeto (Cachi2) output
+      if [ -f "$(workspaces.source.path)/cachi2/output/bom.json" ]; then
+        mobster_args=(generate --output sbom.json)
+        if [ "${SBOM_SKIP_VALIDATION}" == "true" ]; then
+          echo "Skipping SBOM validation"
+          mobster_args+=(--skip-validation)
+        fi
+        mobster_args+=(
+          oci-image
+          --from-hermeto "$(workspaces.source.path)/cachi2/output/bom.json"
+          --image-pullspec "$IMAGE_URL"
+          --image-digest "$IMAGE_DIGEST"
+        )
+        mobster "${mobster_args[@]}"
+      else
+        echo "The SBOM file for fetched artifacts is not found!"
+        exit 1
+      fi
+    securityContext:
+      capabilities:
+        add:
+          - SETFCAP
+    volumeMounts:
+    - name: trusted-ca
+      mountPath: /mnt/trusted-ca
+      readOnly: true
+    workingDir: $(workspaces.source.path)
+  - name: upload-sbom
+    image: quay.io/konflux-ci/task-runner:1.4.1@sha256:d9feec6f2ce9b10cfb76b45ea14f83b5ed9f231de7d6083291550aebe8eb09ea
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      ca_bundle=/mnt/trusted-ca/ca-bundle.crt
+      if [ -f "$ca_bundle" ]; then
+        echo "INFO: Using mounted CA bundle: $ca_bundle"
+        cp -vf $ca_bundle /etc/pki/ca-trust/source/anchors
+        update-ca-trust
+      fi
+
+      if jq -e '.bomFormat == "CycloneDX"' < sbom.json >/dev/null; then
+        sbom_type=cyclonedx
+      else
+        sbom_type=spdx
+      fi
+
+      echo "Pushing sbom to registry"
+      if ! retry cosign attach sbom --sbom sbom.json --type "$sbom_type" "$IMAGE"
+      then
+          echo "Failed to push sbom to registry"
+          exit 1
+      fi
+
+      # Remove tag from IMAGE while allowing registry to contain a port number.
+      sbom_repo="${IMAGE%:*}"
+      sbom_tag="sha256-$(< "$(results.IMAGE_DIGEST.path)" cut -d: -f2).sbom"
+      # The SBOM_BLOB_URL is created by `cosign attach sbom`.
+      echo -n "${sbom_repo}:${sbom_tag}" | tee "$(results.SBOM_BLOB_URL.path)"
+    computeResources:
+      limits:
+        memory: 512Mi
+      requests:
+        memory: 256Mi
+        cpu: 100m
+    volumeMounts:
+    - name: trusted-ca
+      mountPath: /mnt/trusted-ca
+      readOnly: true
+    workingDir: $(workspaces.source.path)
+    securityContext:
+      runAsUser: 0
+      runAsNonRoot: false
+
+  volumes:
+  - name: shared
+    emptyDir: {}
+  - name: trusted-ca
+    configMap:
+      name: $(params.caTrustConfigMapName)
+      items:
+        - key: $(params.caTrustConfigMapKey)
+          path: ca-bundle.crt
+      optional: true
+  workspaces:
+  - name: source
+    description: Workspace containing the source code to build.
