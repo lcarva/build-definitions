@@ -192,10 +192,24 @@ spec:
           value: $(params.enable-package-registry-proxy)
       script: |
         #!/bin/bash
+        set -x
 
         if [ -n "${WORKSPACE_NETRC_PATH}" ]; then
+          echo "Using netrc file from workspace"
+          ls -la "${WORKSPACE_NETRC_PATH}"
+          ls -la "${WORKSPACE_NETRC_PATH}.netrc"
+          echo "File digest: $(sha256sum ${WORKSPACE_NETRC_PATH}/.netrc)"
           export NETRC="${WORKSPACE_NETRC_PATH}/.netrc"
+        else
+          echo "netrc file not configured"
         fi
+
+        echo "NETRC=$(printf ${NETRC})"
+        cp "${NETRC}" "${HOME}/.netrc"
+
+        curl --netrc -vL https://packages.redhat.com/api/pulp-content/public-trusted-libraries/main/blinker-1.9.0.tar.gz | sha256sum
+
+        echo "Done netrc bonanza"
 
         CA_BUNDLE_PATH=/mnt/trusted-ca/ca-bundle.crt
         SERVICE_CA_BUNDLE_PATH=/mnt/service-ca/ca-bundle.crt
