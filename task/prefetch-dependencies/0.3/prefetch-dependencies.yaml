@@ -144,7 +144,7 @@ spec:
           export KBC_PD_CONFIG_FILE=/mnt/config/config.yaml
         fi
 
-        pip install --no-deps --force-reinstall git+https://github.com/hermetoproject/hermeto.git@bb68e974
+        python3 /usr/share/python3-wheels/pip-23.3.2-py3-none-any.whl/pip install --force-reinstall git+https://github.com/hermetoproject/hermeto.git@bb68e974
         konflux-build-cli prefetch-dependencies
 
   workspaces:
