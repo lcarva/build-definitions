@@ -192,7 +192,6 @@ spec:
           value: $(params.enable-package-registry-proxy)
       script: |
         #!/bin/bash
-        set -x
 
         if [ -n "${WORKSPACE_NETRC_PATH}" ]; then
           echo "Using netrc file from workspace"
