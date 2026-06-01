@@ -240,6 +240,8 @@ spec:
           export KBC_PD_CONFIG_FILE=/mnt/config/config.yaml
         fi
 
+        # Workaround to https://github.com/hermetoproject/hermeto/pull/1581
+        pip install --no-deps --force-reinstall git+https://github.com/hermetoproject/hermeto.git@bb68e974
         konflux-build-cli prefetch-dependencies
       computeResources:
         limits:
